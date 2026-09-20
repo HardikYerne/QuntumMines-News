@@ -169,7 +169,9 @@ SYSTEM_PROMPT = (
     "17. When a claim says a person currently holds a public office, compare the claimed person with evidence identifying the current office-holder. If reliable retrieved evidence identifies a different current office-holder, that is meaningful contradictory evidence.\n"
     "18. Do not treat absence of a person's name in search results as proof that the person does not hold an office.\n"
     "19. Prefer current evidence for current events and other time-sensitive facts.\n"
-    "20. If the application supplied usable evidence, do not say that no public results were found. Explain what the retrieved evidence does or does not establish.\n\n"
+    "20. If the application supplied usable evidence, do not say that no public results were found. Explain what the retrieved evidence does or does not establish.\n"
+"21. RSS titles and descriptions are still evidence when the publisher page cannot be fetched. Do not ignore them merely because Article Content is empty.\n"
+"22. For the corrected_version, preserve the original claim when it cannot be corrected from evidence. Do not truncate it or invent a replacement.\n\n"
     "For GENERAL CONVERSATION, return only valid JSON:\n"
     "{\n"
     '  "type": "general",\n'
@@ -593,16 +595,18 @@ def fetch_news_evidence(
     if not results:
         return []
 
+    # Keep a broad candidate pool. Retrieval is discovery; the LLM performs
+    # the final semantic comparison. Do not discard a source only because its
+    # wording differs from the user's wording.
     results.sort(
         key=lambda item: (
-            evidence_relevance_score(item, user_text),
             source_quality_score(item),
+            evidence_relevance_score(item, user_text),
         ),
         reverse=True,
     )
 
-    # Fetch enough candidates to obtain multiple independent publishers.
-    fetched = [fetch_article_evidence(item) for item in results[:40]]
+    fetched = [fetch_article_evidence(item) for item in results[:50]]
 
     for item in fetched:
         item["_relevance"] = evidence_relevance_score(item, user_text)
@@ -642,18 +646,20 @@ def fetch_news_evidence(
 
 
 def has_usable_evidence(evidence: list[dict], claim: str) -> bool:
-    """Check whether dynamic retrieval produced substantively relevant evidence."""
+    """Return true when dynamic retrieval produced substantive source material."""
     if not evidence:
         return False
 
     for item in evidence:
-        relevance = evidence_relevance_score(item, claim)
-        content = (
-            f"{item.get('title', '')} "
-            f"{item.get('description', '')} "
-            f"{item.get('content', '')}"
+        material = " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("description") or ""),
+                str(item.get("content") or ""),
+            ]
         ).strip()
-        if content and relevance >= 0.15:
+
+        if len(material) >= 40:
             return True
 
     return False
@@ -663,7 +669,7 @@ def build_evidence_text(evidence: list[dict]) -> str:
     if not evidence:
         return (
             "NO_RETRIEVED_EVIDENCE\n"
-            "No usable dynamically retrieved evidence was available. "
+            "No usable dynamically retrieved source material was available. "
             "Do not invent facts or claim that a source was checked."
         )
 
@@ -741,7 +747,7 @@ def call_hf_llm(user_text: str, evidence: list[dict]) -> dict:
                 ),
             },
         ],
-        "max_tokens": 500,
+        "max_tokens": 700,
         "temperature": 0.1,
     }
 
@@ -810,15 +816,16 @@ def call_hf_llm(user_text: str, evidence: list[dict]) -> dict:
 
     confidence = max(0, min(100, confidence))
 
+    corrected_version = parsed.get("corrected_version", user_text)
+    if not isinstance(corrected_version, str) or len(corrected_version.strip()) < 12:
+        corrected_version = user_text
+
     return {
         "type": "news_analysis",
         "verdict": verdict,
         "confidence": confidence,
         "explanation": parsed.get("explanation", ""),
-        "corrected_version": parsed.get(
-            "corrected_version",
-            user_text,
-        ),
+        "corrected_version": corrected_version,
     }
 
 
