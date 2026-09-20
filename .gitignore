@@ -219,3 +219,10 @@ __marimo__/
 .env
 .venv
 .vercel
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.env
+.venv/
+__pycache__/
