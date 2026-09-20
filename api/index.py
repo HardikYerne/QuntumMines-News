@@ -123,6 +123,7 @@ HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
 # Google News RSS is used only to retrieve current public evidence.
 # No API key is required.
 NEWS_RSS_URL = "https://news.google.com/rss/search"
+GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 
 app = FastAPI(title="Fake News Detector Chatbot")
 
@@ -408,13 +409,70 @@ def fetch_article_evidence(item: dict) -> dict:
         return result
 
 
-def fetch_news_evidence(
-    user_text: str,
-    max_results: int = 12,
+
+def fetch_gdelt_evidence(
+    query: str,
+    max_records: int = 20,
 ) -> list[dict]:
+    """Retrieve current articles dynamically from GDELT."""
+    try:
+        params = {
+            "query": query,
+            "mode": "artlist",
+            "format": "json",
+            "maxrecords": max_records,
+            "timespan": "3months",
+            "sort": "datedesc",
+        }
+
+        response = requests.get(
+            GDELT_DOC_URL,
+            params=params,
+            timeout=15,
+            headers={"User-Agent": "QuntumMines-FakeNewsDetector/1.0"},
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        articles = data.get("articles", [])
+        if not isinstance(articles, list):
+            return []
+
+        evidence = []
+        for article in articles:
+            url = (article.get("url") or "").strip()
+            title = (article.get("title") or "").strip()
+            if not url or not title:
+                continue
+
+            evidence.append(
+                normalize_evidence_item(
+                    {
+                        "title": title,
+                        "description": "",
+                        "published": (
+                            article.get("seendate")
+                            or article.get("socialimage")
+                            or ""
+                        ),
+                        "url": url,
+                        "content": "",
+                    }
+                )
+            )
+
+        return evidence
+
+    except (requests.RequestException, ValueError, TypeError):
+        return []
+    except Exception:
+        return []
+
+
+def collect_dynamic_evidence(user_text: str) -> list[dict]:
     """
-    Dynamically discover evidence through multiple searches, then fetch
-    the underlying publisher pages. No individual news answer is stored.
+    Combine independent dynamic discovery channels.
+    Google News provides broad discovery; GDELT provides direct publisher URLs.
     """
     queries = extract_search_queries(user_text)
     if not queries:
@@ -423,6 +481,7 @@ def fetch_news_evidence(
     results = []
     seen_urls = set()
 
+    # Google News discovery.
     for query in queries:
         params = {
             "q": query,
@@ -445,7 +504,10 @@ def fetch_news_evidence(
                 title = (item.findtext("title") or "").strip()
                 link = (item.findtext("link") or "").strip()
                 pub_date = (item.findtext("pubDate") or "").strip()
-                description = html.unescape(item.findtext("description") or "")
+
+                description = html.unescape(
+                    item.findtext("description") or ""
+                )
                 description = re.sub(r"<[^>]+>", " ", description)
                 description = re.sub(r"\s+", " ", description).strip()
 
@@ -453,18 +515,42 @@ def fetch_news_evidence(
                     continue
 
                 seen_urls.add(link)
-                results.append(normalize_evidence_item({
-                    "title": title,
-                    "description": description,
-                    "published": pub_date,
-                    "url": link,
-                    "content": "",
-                }))
-
-        except (requests.RequestException, ET.ParseError):
-            continue
+                results.append(
+                    normalize_evidence_item(
+                        {
+                            "title": title,
+                            "description": description,
+                            "published": pub_date,
+                            "url": link,
+                            "content": "",
+                        }
+                    )
+                )
         except Exception:
             continue
+
+    # GDELT discovery. Use the strongest compact queries first.
+    for query in queries[:4]:
+        for item in fetch_gdelt_evidence(query, max_records=20):
+            url = item.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            results.append(item)
+
+    return results
+
+
+def fetch_news_evidence(
+    user_text: str,
+    max_results: int = 12,
+) -> list[dict]:
+    """
+    Dynamically discover evidence from multiple independent news indexes,
+    then fetch the underlying publisher pages. No individual news answer
+    is stored in the application.
+    """
+    results = collect_dynamic_evidence(user_text)
 
     if not results:
         return []
@@ -478,7 +564,7 @@ def fetch_news_evidence(
     )
 
     # Fetch enough candidates to obtain multiple independent publishers.
-    fetched = [fetch_article_evidence(item) for item in results[:30]]
+    fetched = [fetch_article_evidence(item) for item in results[:40]]
 
     for item in fetched:
         item["_relevance"] = evidence_relevance_score(item, user_text)
