@@ -5,7 +5,105 @@ import html
 import requests
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
-from bs4 import BeautifulSoup
+
+from html.parser import HTMLParser
+
+
+class _ArticleHTMLParser(HTMLParser):
+    """Small stdlib-only HTML extractor for publisher pages."""
+
+    SKIP_TAGS = {
+        "script", "style", "noscript", "svg", "nav", "footer",
+        "header", "form", "aside", "iframe"
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.skip_depth = 0
+        self.in_title = False
+        self.in_meta = False
+        self.meta_attrs = {}
+        self.paragraphs = []
+        self.title_parts = []
+        self.current_parts = []
+        self.current_tag = None
+        self.description = ""
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+
+        if tag in self.SKIP_TAGS:
+            self.skip_depth += 1
+            return
+
+        if self.skip_depth:
+            return
+
+        if tag == "title":
+            self.in_title = True
+
+        if tag == "meta":
+            name = (attrs.get("name") or "").lower()
+            prop = (attrs.get("property") or "").lower()
+            content = (attrs.get("content") or "").strip()
+            if content and (
+                name in {"description", "twitter:description"}
+                or prop == "og:description"
+            ) and not self.description:
+                self.description = content
+
+        if tag in {"p", "h2", "h3"}:
+            self.current_parts = []
+            self.current_tag = tag
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP_TAGS:
+            if self.skip_depth:
+                self.skip_depth -= 1
+            return
+
+        if self.skip_depth:
+            return
+
+        if tag == "title":
+            self.in_title = False
+
+        if tag in {"p", "h2", "h3"} and self.current_tag == tag:
+            value = re.sub(r"\s+", " ", " ".join(self.current_parts)).strip()
+            if len(value) >= 35:
+                self.paragraphs.append(value)
+            self.current_parts = []
+            self.current_tag = None
+
+    def handle_data(self, data):
+        if self.skip_depth:
+            return
+
+        if self.in_title:
+            self.title_parts.append(data)
+
+        if self.current_tag:
+            self.current_parts.append(data)
+
+
+def parse_html_evidence(html_text: str) -> tuple[str, str, str]:
+    parser = _ArticleHTMLParser()
+    parser.feed(html_text)
+    parser.close()
+
+    title = re.sub(r"\s+", " ", " ".join(parser.title_parts)).strip()
+    description = re.sub(r"\s+", " ", parser.description).strip()
+
+    seen = set()
+    paragraphs = []
+    for paragraph in parser.paragraphs:
+        key = paragraph.lower()
+        if key not in seen:
+            seen.add(key)
+            paragraphs.append(paragraph)
+
+    return title[:500], description[:1500], "\n".join(paragraphs)[:12000]
+
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -262,46 +360,7 @@ def evidence_relevance_score(item: dict, claim: str) -> float:
 
 def extract_article_text(html_text: str) -> tuple[str, str, str]:
     """Extract generic publisher-page title, description, and article text."""
-    soup = BeautifulSoup(html_text, "html.parser")
-
-    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header", "form", "aside"]):
-        tag.decompose()
-
-    title = soup.title.get_text(" ", strip=True) if soup.title else ""
-
-    description = ""
-    for attrs in (
-        {"name": "description"},
-        {"property": "og:description"},
-        {"name": "twitter:description"},
-    ):
-        tag = soup.find("meta", attrs=attrs)
-        if tag and tag.get("content"):
-            description = tag["content"].strip()
-            break
-
-    container = soup.find("article")
-    if not container:
-        container = soup.find(attrs={"itemprop": "articleBody"})
-    if not container:
-        container = soup.body
-
-    paragraphs = []
-    if container:
-        for p in container.find_all(["p", "h2", "h3"]):
-            value = re.sub(r"\s+", " ", p.get_text(" ", strip=True))
-            if len(value) >= 35:
-                paragraphs.append(value)
-
-    seen = set()
-    clean = []
-    for paragraph in paragraphs:
-        key = paragraph.lower()
-        if key not in seen:
-            seen.add(key)
-            clean.append(paragraph)
-
-    return title[:500], description[:1500], "\n".join(clean)[:12000]
+    return parse_html_evidence(html_text)
 
 
 def fetch_article_evidence(item: dict) -> dict:
@@ -386,10 +445,9 @@ def fetch_news_evidence(
                 title = (item.findtext("title") or "").strip()
                 link = (item.findtext("link") or "").strip()
                 pub_date = (item.findtext("pubDate") or "").strip()
-                description = BeautifulSoup(
-                    item.findtext("description") or "",
-                    "html.parser",
-                ).get_text(" ", strip=True)
+                description = html.unescape(item.findtext("description") or "")
+                description = re.sub(r"<[^>]+>", " ", description)
+                description = re.sub(r"\s+", " ", description).strip()
 
                 if not title or not link or link in seen_urls:
                     continue
