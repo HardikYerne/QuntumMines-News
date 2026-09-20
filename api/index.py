@@ -5,6 +5,7 @@ import html
 import requests
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
+from bs4 import BeautifulSoup
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -61,7 +62,10 @@ SYSTEM_PROMPT = (
     "8. For LIKELY FAKE, require meaningful contradictory evidence or a clear "
     "internal factual contradiction.\n"
     "9. Otherwise return UNVERIFIABLE.\n"
-"10. For numerical claims, compare the exact numbers, dates, units, and subject in the evidence.\n"
+    "10. Use retrieved evidence, not memorized facts, as the primary basis for the verdict.\n"
+    "11. When multiple independent sources agree on material facts, treat that agreement as stronger evidence.\n"
+    "12. Do not treat source count alone as proof; compare the actual facts, dates, numbers, and context.\n"
+    "13. If sources conflict, explain the conflict and prefer the most direct and authoritative evidence.\n""10. For numerical claims, compare the exact numbers, dates, units, and subject in the evidence.\n"
 "11. A related article that discusses the same topic but different numbers is not sufficient to prove or disprove the claim.\n"
 "12. For claims containing multiple facts, evaluate each material fact separately.\n"
 
@@ -225,18 +229,18 @@ def source_quality_score(item: dict) -> int:
 
 
 def evidence_relevance_score(item: dict, claim: str) -> float:
-    """Measure how closely retrieved evidence matches the actual claim."""
+    """Score evidence using title, description, and fetched article text."""
     claim_tokens = set(meaningful_tokens(claim))
     if not claim_tokens:
         return 0.0
 
     title = (item.get("title") or "").lower()
     description = (item.get("description") or "").lower()
-    combined = f"{title} {description}"
+    content = (item.get("content") or "").lower()
+    combined = f"{title} {description} {content}"
 
     body_matches = sum(1 for token in claim_tokens if token in combined)
     title_matches = sum(1 for token in claim_tokens if token in title)
-
     coverage = body_matches / len(claim_tokens)
     title_coverage = title_matches / len(claim_tokens)
 
@@ -247,15 +251,102 @@ def evidence_relevance_score(item: dict, claim: str) -> float:
         if claim_numbers else 0.0
     )
 
-    # Exact numbers are especially important for numerical claims.
     score = (
-        coverage * 0.50
-        + title_coverage * 0.20
-        + number_match * 0.20
+        coverage * 0.45
+        + title_coverage * 0.15
+        + number_match * 0.30
         + (0.10 if source_quality_score(item) >= 90 else 0.0)
     )
     return min(score, 1.0)
 
+
+def extract_article_text(html_text: str) -> tuple[str, str, str]:
+    """Extract generic publisher-page title, description, and article text."""
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header", "form", "aside"]):
+        tag.decompose()
+
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+
+    description = ""
+    for attrs in (
+        {"name": "description"},
+        {"property": "og:description"},
+        {"name": "twitter:description"},
+    ):
+        tag = soup.find("meta", attrs=attrs)
+        if tag and tag.get("content"):
+            description = tag["content"].strip()
+            break
+
+    container = soup.find("article")
+    if not container:
+        container = soup.find(attrs={"itemprop": "articleBody"})
+    if not container:
+        container = soup.body
+
+    paragraphs = []
+    if container:
+        for p in container.find_all(["p", "h2", "h3"]):
+            value = re.sub(r"\s+", " ", p.get_text(" ", strip=True))
+            if len(value) >= 35:
+                paragraphs.append(value)
+
+    seen = set()
+    clean = []
+    for paragraph in paragraphs:
+        key = paragraph.lower()
+        if key not in seen:
+            seen.add(key)
+            clean.append(paragraph)
+
+    return title[:500], description[:1500], "\n".join(clean)[:12000]
+
+
+def fetch_article_evidence(item: dict) -> dict:
+    """Follow the discovered URL and retrieve the underlying publisher page."""
+    result = dict(item)
+    url = item.get("url", "")
+
+    try:
+        response = requests.get(
+            url,
+            timeout=10,
+            allow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/153 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
+        response.raise_for_status()
+
+        final_url = response.url or url
+        content_type = response.headers.get("content-type", "").lower()
+        if "html" not in content_type:
+            return result
+
+        page_title, page_description, article_content = extract_article_text(response.text)
+
+        if page_title:
+            result["title"] = page_title
+        if page_description:
+            result["description"] = page_description
+
+        result["content"] = article_content
+        result["url"] = final_url
+        result["publisher"] = source_domain(final_url)
+        result["article_fetched"] = bool(article_content)
+        return result
+
+    except Exception:
+        result["content"] = ""
+        result["publisher"] = source_domain(url)
+        result["article_fetched"] = False
+        return result
 
 
 def fetch_news_evidence(
@@ -263,8 +354,8 @@ def fetch_news_evidence(
     max_results: int = 12,
 ) -> list[dict]:
     """
-    Dynamically retrieve evidence from multiple Google News searches.
-    A failed query does not discard successful results from other queries.
+    Dynamically discover evidence through multiple searches, then fetch
+    the underlying publisher pages. No individual news answer is stored.
     """
     queries = extract_search_queries(user_text)
     if not queries:
@@ -295,7 +386,10 @@ def fetch_news_evidence(
                 title = (item.findtext("title") or "").strip()
                 link = (item.findtext("link") or "").strip()
                 pub_date = (item.findtext("pubDate") or "").strip()
-                description = (item.findtext("description") or "").strip()
+                description = BeautifulSoup(
+                    item.findtext("description") or "",
+                    "html.parser",
+                ).get_text(" ", strip=True)
 
                 if not title or not link or link in seen_urls:
                     continue
@@ -306,12 +400,16 @@ def fetch_news_evidence(
                     "description": description,
                     "published": pub_date,
                     "url": link,
+                    "content": "",
                 }))
 
         except (requests.RequestException, ET.ParseError):
             continue
         except Exception:
             continue
+
+    if not results:
+        return []
 
     results.sort(
         key=lambda item: (
@@ -321,8 +419,43 @@ def fetch_news_evidence(
         reverse=True,
     )
 
-    return results[:max_results]
+    # Fetch enough candidates to obtain multiple independent publishers.
+    fetched = [fetch_article_evidence(item) for item in results[:30]]
 
+    for item in fetched:
+        item["_relevance"] = evidence_relevance_score(item, user_text)
+
+    fetched.sort(
+        key=lambda item: (
+            item.get("_relevance", 0.0),
+            source_quality_score(item),
+        ),
+        reverse=True,
+    )
+
+    # Prefer independent domains rather than many copies from one publisher.
+    selected = []
+    domain_counts = {}
+
+    for item in fetched:
+        domain = source_domain(item.get("url", "")) or "unknown"
+        if domain_counts.get(domain, 0) >= 2:
+            continue
+        selected.append(item)
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        if len(selected) >= max_results:
+            break
+
+    if len(selected) < min(max_results, len(fetched)):
+        selected_urls = {item.get("url") for item in selected}
+        for item in fetched:
+            if item.get("url") in selected_urls:
+                continue
+            selected.append(item)
+            if len(selected) >= max_results:
+                break
+
+    return selected
 
 
 def build_evidence_text(evidence: list[dict]) -> str:
@@ -342,6 +475,7 @@ def build_evidence_text(evidence: list[dict]) -> str:
             f"Title: {item['title']}\n"
             f"Published: {item['published']}\n"
             f"Description: {item['description']}\n"
+            f"Article Content: {item.get('content', '')[:12000]}\n"
             f"URL: {item['url']}"
         )
 
