@@ -1,7 +1,9 @@
 import os
 import json
 import re
+import html
 import requests
+from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
 from dotenv import load_dotenv
@@ -48,7 +50,7 @@ SYSTEM_PROMPT = (
     "claim, or asks whether information is true, fake, misleading, or credible, "
     "analyze the claim using the evidence supplied by the application.\n\n"
     "IMPORTANT EVIDENCE RULES:\n"
-    "1. Evidence below comes from retrieved public news results.\n"
+    "1. Evidence below comes from dynamically retrieved public sources.\n"
     "2. Do not claim that you personally browsed, searched, or verified anything.\n"
     "3. Do not invent sources, facts, dates, or evidence.\n"
     "4. If the supplied evidence does not establish the claim, use UNVERIFIABLE.\n"
@@ -59,7 +61,16 @@ SYSTEM_PROMPT = (
     "8. For LIKELY FAKE, require meaningful contradictory evidence or a clear "
     "internal factual contradiction.\n"
     "9. Otherwise return UNVERIFIABLE.\n"
-    "10. Never say 'I couldn't find reliable sources' unless the application "
+    "10. When a claim says that a person currently holds a public office, "
+    "compare the claimed person with evidence identifying the current office-holder. "
+    "If reliable retrieved evidence identifies a different current office-holder, "
+    "that is meaningful contradictory evidence and the claim should be classified "
+    "as LIKELY FAKE.\n"
+    "11. Do not treat absence of a person's name in search results as proof that "
+    "the person does not hold an office. Use explicit contradictory evidence when available.\n"
+    "12. Prefer current and authoritative evidence when the claim concerns a "
+    "current office, current role, current event, or other time-sensitive fact.\n"
+    "13. Never say 'I couldn't find reliable sources' unless the application "
     "actually supplied no useful evidence. Prefer 'The retrieved evidence is "
     "insufficient to establish the claim.'\n\n"
     "For GENERAL CONVERSATION, return only valid JSON:\n"
@@ -95,11 +106,9 @@ def get_local_general_response(user_text: str):
     return GREETING_RESPONSES.get(normalized)
 
 
-def extract_search_query(user_text: str) -> str:
-    """Create a short search query without changing the original claim."""
+def clean_search_text(user_text: str) -> str:
     text = re.sub(r"\s+", " ", user_text.strip())
 
-    # Remove common request prefixes so the search focuses on the claim.
     text = re.sub(
         r"^(is it true that|is this true|fact check|fact-check|check this|verify this)\s*[:,-]?\s*",
         "",
@@ -107,59 +116,157 @@ def extract_search_query(user_text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Keep the query reasonably short for Google News RSS.
-    words = text.split()
-    return " ".join(words[:45])
+    return text
 
 
-def fetch_news_evidence(user_text: str, max_results: int = 6) -> list[dict]:
-    """
-    Retrieve public news-search results through Google News RSS.
-    Failure is non-fatal; the LLM can then return UNVERIFIABLE.
-    """
-    query = extract_search_query(user_text)
-    if not query:
+def extract_search_queries(user_text: str) -> list[str]:
+    """Build multiple dynamic search queries without storing individual news."""
+    text = clean_search_text(user_text)
+    if not text:
         return []
 
-    params = {
-        "q": query,
-        "hl": "en-IN",
-        "gl": "IN",
-        "ceid": "IN:en",
+    words = text.split()
+    queries = [" ".join(words[:45])]
+    normalized = text.lower()
+
+    # For public-office claims, search for the office holder itself as well
+    # as the original claim. This is what prevents a claim about an unknown
+    # person from becoming UNVERIFIABLE merely because their name has little
+    # news coverage.
+    office_terms = [
+        "prime minister", "pm", "president", "vice president",
+        "chief minister", "cm", "governor", "minister", "mayor",
+        "chief justice", "chairman", "director", "ceo"
+    ]
+    office = next((x for x in office_terms if re.search(rf"\b{re.escape(x)}\b", normalized)), None)
+
+    countries = [
+        "india", "united states", "usa", "united kingdom", "uk",
+        "canada", "australia"
+    ]
+    country = next((x for x in countries if x in normalized), None)
+
+    if office:
+        if country:
+            queries.append(f"current {office} of {country}")
+            queries.append(f"{office} {country} current office holder")
+        else:
+            queries.append(f"current {office}")
+
+        # Government-domain searches are useful for official/current roles.
+        if country == "india":
+            if office in {"prime minister", "pm"}:
+                queries.append("site:pmindia.gov.in current Prime Minister of India")
+            elif office in {"president"}:
+                queries.append("site:presidentofindia.nic.in current President of India")
+            else:
+                queries.append(f"site:gov.in current {office} India")
+
+    if any(term in normalized for term in ("today", "current", "currently", "latest", "announced", "announces")):
+        queries.append(f"{text[:160]} latest")
+
+    return list(dict.fromkeys(q.strip() for q in queries if q.strip()))
+
+
+def source_domain(url: str) -> str:
+    try:
+        hostname = urlparse(url).hostname or ""
+        hostname = hostname.lower()
+        return hostname[4:] if hostname.startswith("www.") else hostname
+    except Exception:
+        return ""
+
+
+def source_score(item: dict) -> int:
+    """Rank evidence only; this function never decides the verdict."""
+    domain = source_domain(item.get("url", ""))
+    title = (item.get("title") or "").lower()
+    description = (item.get("description") or "").lower()
+
+    score = 0
+    authoritative = {
+        "pmindia.gov.in", "presidentofindia.nic.in", "india.gov.in",
+        "nasa.gov", "who.int", "un.org", "rbi.org.in", "eci.gov.in"
     }
 
+    if domain in authoritative or domain.endswith(".gov.in") or domain.endswith(".gov"):
+        score += 100
+    elif domain.endswith(".nic.in"):
+        score += 90
+
+    if any(term in title or term in description for term in (
+        "current", "prime minister", "president", "chief minister",
+        "appointed", "elected", "official", "government"
+    )):
+        score += 15
+
+    return score
+
+
+def normalize_evidence_item(item: dict) -> dict:
+    title = html.unescape((item.get("title") or "").strip())
+    description = html.unescape((item.get("description") or "").strip())
+    description = re.sub(r"<[^>]+>", " ", description)
+    description = re.sub(r"\s+", " ", description).strip()
+
+    return {
+        "title": title,
+        "description": description,
+        "published": (item.get("published") or "").strip(),
+        "url": (item.get("url") or "").strip(),
+    }
+
+
+def fetch_news_evidence(user_text: str, max_results: int = 10) -> list[dict]:
+    """Dynamically retrieve and rank current public evidence from Google News RSS."""
+    queries = extract_search_queries(user_text)
+    if not queries:
+        return []
+
+    results = []
+    seen_urls = set()
+
     try:
-        response = requests.get(
-            NEWS_RSS_URL,
-            params=params,
-            timeout=12,
-            headers={"User-Agent": "QuntumMines-FakeNewsDetector/1.0"},
-        )
-        response.raise_for_status()
+        for query in queries:
+            params = {
+                "q": query,
+                "hl": "en-IN",
+                "gl": "IN",
+                "ceid": "IN:en",
+            }
 
-        root = ET.fromstring(response.content)
-        results = []
+            response = requests.get(
+                NEWS_RSS_URL,
+                params=params,
+                timeout=12,
+                headers={"User-Agent": "QuntumMines-FakeNewsDetector/1.0"},
+            )
+            response.raise_for_status()
 
-        for item in root.findall(".//item")[:max_results]:
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            pub_date = (item.findtext("pubDate") or "").strip()
-            description = (item.findtext("description") or "").strip()
+            root = ET.fromstring(response.content)
 
-            if title:
-                results.append(
-                    {
-                        "title": title,
-                        "description": description,
-                        "published": pub_date,
-                        "url": link,
-                    }
-                )
+            for item in root.findall(".//item"):
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                pub_date = (item.findtext("pubDate") or "").strip()
+                description = (item.findtext("description") or "").strip()
 
-        return results
+                if not title or not link or link in seen_urls:
+                    continue
+
+                seen_urls.add(link)
+                results.append(normalize_evidence_item({
+                    "title": title,
+                    "description": description,
+                    "published": pub_date,
+                    "url": link,
+                }))
+
+        results.sort(key=source_score, reverse=True)
+        return results[:max_results]
 
     except Exception:
-        # Do not turn a search/network problem into a fake/real verdict.
+        # Search/network failure must not automatically become a fake/real verdict.
         return []
 
 
@@ -175,6 +282,7 @@ def build_evidence_text(evidence: list[dict]) -> str:
     for index, item in enumerate(evidence, start=1):
         chunks.append(
             f"[Source {index}]\n"
+            f"Domain: {source_domain(item.get('url', ''))}\n"
             f"Title: {item['title']}\n"
             f"Published: {item['published']}\n"
             f"Description: {item['description']}\n"
@@ -210,8 +318,10 @@ def call_hf_llm(user_text: str, evidence: list[dict]) -> dict:
                     f'"""\n{user_text}\n"""\n\n'
                     "RETRIEVED EVIDENCE:\n"
                     f"{evidence_text}\n\n"
-                    "Analyze the user claim using only the supplied evidence "
-                    "and your general reasoning. Return JSON only."
+                    "Analyze the user claim using the supplied evidence and "
+                    "general reasoning. For current public-office claims, explicitly "
+                    "compare the claimed person with the current office-holder shown "
+                    "by the evidence. Return JSON only."
                 ),
             },
         ],
@@ -236,25 +346,36 @@ def call_hf_llm(user_text: str, evidence: list[dict]) -> dict:
     content = data["choices"][0]["message"]["content"]
 
     cleaned = re.sub(
-        r"^```(?:json)?|```$",
+        r"^```(?:json)?\s*|\s*```$",
         "",
         content.strip(),
-        flags=re.MULTILINE,
+        flags=re.IGNORECASE,
     ).strip()
 
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        return {
-            "type": "news_analysis",
-            "verdict": "UNVERIFIABLE",
-            "confidence": 0,
-            "explanation": (
-                "The analysis model returned an invalid response format, "
-                "so the claim could not be classified safely."
-            ),
-            "corrected_version": user_text,
-        }
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end > start:
+            try:
+                parsed = json.loads(cleaned[start:end + 1])
+            except json.JSONDecodeError:
+                parsed = None
+        else:
+            parsed = None
+
+        if not isinstance(parsed, dict):
+            return {
+                "type": "news_analysis",
+                "verdict": "UNVERIFIABLE",
+                "confidence": 0,
+                "explanation": (
+                    "The analysis model returned an invalid response format, "
+                    "so the claim could not be classified safely."
+                ),
+                "corrected_version": user_text,
+            }
 
     if parsed.get("type") == "general":
         return {
