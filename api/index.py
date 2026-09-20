@@ -2,19 +2,21 @@ import os
 import json
 import re
 import requests
-from urllib.parse import quote_plus
 from xml.etree import ElementTree as ET
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ---- Config ----
+load_dotenv()
+
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_LLM_MODEL = os.environ.get(
     "HF_LLM_MODEL",
     "meta-llama/Llama-3.1-8B-Instruct",
 )
+
 HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
 
 # Google News RSS is used only to retrieve current public evidence.
