@@ -61,6 +61,10 @@ SYSTEM_PROMPT = (
     "8. For LIKELY FAKE, require meaningful contradictory evidence or a clear "
     "internal factual contradiction.\n"
     "9. Otherwise return UNVERIFIABLE.\n"
+"10. For numerical claims, compare the exact numbers, dates, units, and subject in the evidence.\n"
+"11. A related article that discusses the same topic but different numbers is not sufficient to prove or disprove the claim.\n"
+"12. For claims containing multiple facts, evaluate each material fact separately.\n"
+
     "10. When a claim says that a person currently holds a public office, "
     "compare the claimed person with evidence identifying the current office-holder. "
     "If reliable retrieved evidence identifies a different current office-holder, "
@@ -120,49 +124,60 @@ def clean_search_text(user_text: str) -> str:
 
 
 def extract_search_queries(user_text: str) -> list[str]:
-    """Build multiple dynamic search queries without storing individual news."""
+    """Generate dynamic searches without storing individual news."""
     text = clean_search_text(user_text)
     if not text:
         return []
 
-    words = text.split()
-    queries = [" ".join(words[:45])]
+    queries = [" ".join(text.split()[:45])]
+
+    tokens = meaningful_tokens(text)
+    if tokens:
+        queries.append(" ".join(tokens[:24]))
+
+    numbers = re.findall(r"\b\d+(?:\.\d+)?%?\b", text)
+    if numbers and tokens:
+        queries.append(" ".join(tokens[:18]) + " " + " ".join(numbers[:6]))
+
     normalized = text.lower()
 
-    # For public-office claims, search for the office holder itself as well
-    # as the original claim. This is what prevents a claim about an unknown
-    # person from becoming UNVERIFIABLE merely because their name has little
-    # news coverage.
     office_terms = [
         "prime minister", "pm", "president", "vice president",
         "chief minister", "cm", "governor", "minister", "mayor",
-        "chief justice", "chairman", "director", "ceo"
+        "chief justice", "chairman", "director", "ceo",
     ]
-    office = next((x for x in office_terms if re.search(rf"\b{re.escape(x)}\b", normalized)), None)
+    office = next(
+        (x for x in office_terms if re.search(rf"\b{re.escape(x)}\b", normalized)),
+        None,
+    )
 
     countries = [
-        "india", "united states", "usa", "united kingdom", "uk",
-        "canada", "australia"
+        "india", "united states", "usa", "united kingdom",
+        "uk", "canada", "australia",
     ]
     country = next((x for x in countries if x in normalized), None)
 
     if office:
+        queries.append(
+            f"current {office} of {country}" if country
+            else f"current {office}"
+        )
         if country:
-            queries.append(f"current {office} of {country}")
             queries.append(f"{office} {country} current office holder")
-        else:
-            queries.append(f"current {office}")
-
-        # Government-domain searches are useful for official/current roles.
         if country == "india":
             if office in {"prime minister", "pm"}:
                 queries.append("site:pmindia.gov.in current Prime Minister of India")
-            elif office in {"president"}:
-                queries.append("site:presidentofindia.nic.in current President of India")
+            elif office == "president":
+                queries.append(
+                    "site:presidentofindia.nic.in current President of India"
+                )
             else:
                 queries.append(f"site:gov.in current {office} India")
 
-    if any(term in normalized for term in ("today", "current", "currently", "latest", "announced", "announces")):
+    if any(
+        x in normalized
+        for x in ("today", "current", "currently", "latest", "announced", "announces")
+    ):
         queries.append(f"{text[:160]} latest")
 
     return list(dict.fromkeys(q.strip() for q in queries if q.strip()))
@@ -177,48 +192,80 @@ def source_domain(url: str) -> str:
         return ""
 
 
-def source_score(item: dict) -> int:
-    """Rank evidence only; this function never decides the verdict."""
-    domain = source_domain(item.get("url", ""))
-    title = (item.get("title") or "").lower()
-    description = (item.get("description") or "").lower()
+def meaningful_tokens(text: str) -> list[str]:
+    """Extract useful words while preserving numbers and years."""
+    stopwords = {
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+        "to", "of", "in", "on", "at", "for", "from", "by", "with", "and", "or",
+        "as", "that", "this", "it", "its", "has", "have", "had", "will", "would",
+        "can", "could", "may", "might", "should", "do", "does", "did", "than",
+        "then", "over", "after", "before", "into", "about", "according", "said",
+        "says", "claim", "claims", "news", "report", "reported",
+    }
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z'-]*|\d+(?:\.\d+)?%?", text.lower())
+    return [t for t in tokens if t not in stopwords and len(t) > 1]
 
-    score = 0
+
+def source_quality_score(item: dict) -> int:
+    """Rank source quality only; this never decides the verdict."""
+    domain = source_domain(item.get("url", ""))
     authoritative = {
         "pmindia.gov.in", "presidentofindia.nic.in", "india.gov.in",
-        "nasa.gov", "who.int", "un.org", "rbi.org.in", "eci.gov.in"
+        "rbi.org.in", "eci.gov.in", "nasa.gov", "who.int", "un.org",
     }
-
-    if domain in authoritative or domain.endswith(".gov.in") or domain.endswith(".gov"):
-        score += 100
-    elif domain.endswith(".nic.in"):
-        score += 90
-
-    if any(term in title or term in description for term in (
-        "current", "prime minister", "president", "chief minister",
-        "appointed", "elected", "official", "government"
-    )):
-        score += 15
-
-    return score
+    if domain in authoritative:
+        return 100
+    if domain.endswith(".gov.in") or domain.endswith(".gov"):
+        return 95
+    if domain.endswith(".nic.in"):
+        return 90
+    if domain.endswith(".org"):
+        return 50
+    return 10
 
 
-def normalize_evidence_item(item: dict) -> dict:
-    title = html.unescape((item.get("title") or "").strip())
-    description = html.unescape((item.get("description") or "").strip())
-    description = re.sub(r"<[^>]+>", " ", description)
-    description = re.sub(r"\s+", " ", description).strip()
+def evidence_relevance_score(item: dict, claim: str) -> float:
+    """Measure how closely retrieved evidence matches the actual claim."""
+    claim_tokens = set(meaningful_tokens(claim))
+    if not claim_tokens:
+        return 0.0
 
-    return {
-        "title": title,
-        "description": description,
-        "published": (item.get("published") or "").strip(),
-        "url": (item.get("url") or "").strip(),
-    }
+    title = (item.get("title") or "").lower()
+    description = (item.get("description") or "").lower()
+    combined = f"{title} {description}"
+
+    body_matches = sum(1 for token in claim_tokens if token in combined)
+    title_matches = sum(1 for token in claim_tokens if token in title)
+
+    coverage = body_matches / len(claim_tokens)
+    title_coverage = title_matches / len(claim_tokens)
+
+    claim_numbers = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", claim.lower()))
+    evidence_numbers = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", combined))
+    number_match = (
+        len(claim_numbers & evidence_numbers) / len(claim_numbers)
+        if claim_numbers else 0.0
+    )
+
+    # Exact numbers are especially important for numerical claims.
+    score = (
+        coverage * 0.50
+        + title_coverage * 0.20
+        + number_match * 0.20
+        + (0.10 if source_quality_score(item) >= 90 else 0.0)
+    )
+    return min(score, 1.0)
 
 
-def fetch_news_evidence(user_text: str, max_results: int = 10) -> list[dict]:
-    """Dynamically retrieve and rank current public evidence from Google News RSS."""
+
+def fetch_news_evidence(
+    user_text: str,
+    max_results: int = 12,
+) -> list[dict]:
+    """
+    Dynamically retrieve evidence from multiple Google News searches.
+    A failed query does not discard successful results from other queries.
+    """
     queries = extract_search_queries(user_text)
     if not queries:
         return []
@@ -226,15 +273,15 @@ def fetch_news_evidence(user_text: str, max_results: int = 10) -> list[dict]:
     results = []
     seen_urls = set()
 
-    try:
-        for query in queries:
-            params = {
-                "q": query,
-                "hl": "en-IN",
-                "gl": "IN",
-                "ceid": "IN:en",
-            }
+    for query in queries:
+        params = {
+            "q": query,
+            "hl": "en-IN",
+            "gl": "IN",
+            "ceid": "IN:en",
+        }
 
+        try:
             response = requests.get(
                 NEWS_RSS_URL,
                 params=params,
@@ -242,7 +289,6 @@ def fetch_news_evidence(user_text: str, max_results: int = 10) -> list[dict]:
                 headers={"User-Agent": "QuntumMines-FakeNewsDetector/1.0"},
             )
             response.raise_for_status()
-
             root = ET.fromstring(response.content)
 
             for item in root.findall(".//item"):
@@ -262,12 +308,21 @@ def fetch_news_evidence(user_text: str, max_results: int = 10) -> list[dict]:
                     "url": link,
                 }))
 
-        results.sort(key=source_score, reverse=True)
-        return results[:max_results]
+        except (requests.RequestException, ET.ParseError):
+            continue
+        except Exception:
+            continue
 
-    except Exception:
-        # Search/network failure must not automatically become a fake/real verdict.
-        return []
+    results.sort(
+        key=lambda item: (
+            evidence_relevance_score(item, user_text),
+            source_quality_score(item),
+        ),
+        reverse=True,
+    )
+
+    return results[:max_results]
+
 
 
 def build_evidence_text(evidence: list[dict]) -> str:
@@ -283,6 +338,7 @@ def build_evidence_text(evidence: list[dict]) -> str:
         chunks.append(
             f"[Source {index}]\n"
             f"Domain: {source_domain(item.get('url', ''))}\n"
+            f"Relevance: {item.get('_relevance', 0):.2f}\n"
             f"Title: {item['title']}\n"
             f"Published: {item['published']}\n"
             f"Description: {item['description']}\n"
@@ -305,7 +361,13 @@ def call_hf_llm(user_text: str, evidence: list[dict]) -> dict:
             "corrected_version": user_text,
         }
 
-    evidence_text = build_evidence_text(evidence)
+    ranked_evidence = []
+    for item in evidence:
+        copied = dict(item)
+        copied["_relevance"] = evidence_relevance_score(item, user_text)
+        ranked_evidence.append(copied)
+
+    evidence_text = build_evidence_text(ranked_evidence)
 
     payload = {
         "model": HF_LLM_MODEL,
