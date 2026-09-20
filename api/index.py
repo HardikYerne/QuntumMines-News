@@ -169,9 +169,7 @@ SYSTEM_PROMPT = (
     "17. When a claim says a person currently holds a public office, compare the claimed person with evidence identifying the current office-holder. If reliable retrieved evidence identifies a different current office-holder, that is meaningful contradictory evidence.\n"
     "18. Do not treat absence of a person's name in search results as proof that the person does not hold an office.\n"
     "19. Prefer current evidence for current events and other time-sensitive facts.\n"
-    "20. If the application supplied usable evidence, do not say that no public results were found. Explain what the retrieved evidence does or does not establish.\n"
-"21. RSS titles and descriptions are still evidence when the publisher page cannot be fetched. Do not ignore them merely because Article Content is empty.\n"
-"22. For the corrected_version, preserve the original claim when it cannot be corrected from evidence. Do not truncate it or invent a replacement.\n\n"
+    "20. If the application supplied usable evidence, do not say that no public results were found. Explain what the retrieved evidence does or does not establish.\n\n"
     "For GENERAL CONVERSATION, return only valid JSON:\n"
     "{\n"
     '  "type": "general",\n'
@@ -330,6 +328,8 @@ def meaningful_tokens(text: str) -> list[str]:
 def source_quality_score(item: dict) -> int:
     """Rank source quality only; this never decides the verdict."""
     domain = source_domain(item.get("url", ""))
+    if domain in {"news.google.com", "google.com"}:
+        domain = source_domain(item.get("publisher", ""))
     authoritative = {
         "pmindia.gov.in", "presidentofindia.nic.in", "india.gov.in",
         "rbi.org.in", "eci.gov.in", "nasa.gov", "who.int", "un.org",
@@ -378,20 +378,17 @@ def evidence_relevance_score(item: dict, claim: str) -> float:
 
 
 
+
 def resolve_publisher_url(url: str) -> str:
-    """Resolve a news-index URL to the publisher URL without knowing the story."""
+    """Compatibility helper for callers that need a resolved URL."""
     if not url:
         return url
-
     try:
         response = requests.get(
             url,
-            timeout=8,
+            timeout=4,
             allow_redirects=True,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/153 Safari/537.36"
-            },
+            headers={"User-Agent": "Mozilla/5.0 QuntumMines-FakeNewsDetector/1.0"},
             stream=True,
         )
         return response.url or url
@@ -405,15 +402,20 @@ def extract_article_text(html_text: str) -> tuple[str, str, str]:
 
 
 def fetch_article_evidence(item: dict) -> dict:
-    """Resolve and fetch the dynamically discovered publisher page."""
+    """
+    Fetch one dynamically discovered article.
+    The original RSS/GDELT metadata is retained even when the publisher page
+    cannot be fetched.
+    """
     result = dict(item)
     original_url = item.get("url", "")
-    url = resolve_publisher_url(original_url)
+    if not original_url:
+        return result
 
     try:
         response = requests.get(
-            url,
-            timeout=12,
+            original_url,
+            timeout=6,
             allow_redirects=True,
             headers={
                 "User-Agent": (
@@ -425,32 +427,36 @@ def fetch_article_evidence(item: dict) -> dict:
         )
         response.raise_for_status()
 
-        final_url = response.url or url
+        final_url = response.url or original_url
         content_type = response.headers.get("content-type", "").lower()
+
         if "html" not in content_type:
+            result["publisher"] = source_domain(final_url)
+            result["article_fetched"] = False
             return result
 
         page_title, page_description, article_content = extract_article_text(
             response.text
         )
 
-        if page_title:
-            result["title"] = page_title
-        if page_description:
+        # Do NOT replace a useful news headline with a generic publisher
+        # <title>. Keep the original discovery title as evidence.
+        if page_description and len(page_description) > len(result.get("description", "")):
             result["description"] = page_description
 
-        result["content"] = article_content
+        if article_content:
+            result["content"] = article_content
+
         result["url"] = final_url
         result["publisher"] = source_domain(final_url)
         result["article_fetched"] = bool(article_content)
         result["original_url"] = original_url
         return result
 
-    except Exception:
-        result["content"] = ""
-        result["publisher"] = source_domain(url or original_url)
+    except Exception as exc:
+        print(f"[retrieval] article fetch failed url={original_url!r}: {exc}")
+        result["publisher"] = source_domain(original_url)
         result["article_fetched"] = False
-        result["original_url"] = original_url
         return result
 
 
@@ -509,10 +515,62 @@ def fetch_gdelt_evidence(
         return []
 
 
+
+def fetch_google_news_evidence(query: str, max_records: int = 12) -> list[dict]:
+    """Retrieve current news metadata from Google News RSS."""
+    try:
+        params = {
+            "q": query,
+            "hl": "en-IN",
+            "gl": "IN",
+            "ceid": "IN:en",
+        }
+        response = requests.get(
+            NEWS_RSS_URL,
+            params=params,
+            timeout=6,
+            headers={"User-Agent": "Mozilla/5.0 QuntumMines-FakeNewsDetector/1.0"},
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+
+        evidence = []
+        for item in root.findall(".//item")[:max_records]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub_date = (item.findtext("pubDate") or "").strip()
+            description = html.unescape(item.findtext("description") or "")
+            description = re.sub(r"<[^>]+>", " ", description)
+            description = re.sub(r"\s+", " ", description).strip()
+
+            source_node = item.find("source")
+            source_name = (
+                (source_node.text or "").strip()
+                if source_node is not None else ""
+            )
+
+            if not title or not link:
+                continue
+
+            evidence.append(normalize_evidence_item({
+                "title": title,
+                "description": description,
+                "published": pub_date,
+                "url": link,
+                "content": "",
+                "publisher": source_name,
+            }))
+        return evidence
+    except Exception as exc:
+        print(f"[retrieval] Google News failed for query={query!r}: {exc}")
+        return []
+
+
 def collect_dynamic_evidence(user_text: str) -> list[dict]:
     """
-    Combine independent dynamic discovery channels.
-    Google News provides broad discovery; GDELT provides direct publisher URLs.
+    Dynamically collect evidence from multiple independent discovery channels.
+    Retrieval is parallelized so a slow source does not make the serverless
+    request return an empty evidence set.
     """
     queries = extract_search_queries(user_text)
     if not queries:
@@ -521,62 +579,32 @@ def collect_dynamic_evidence(user_text: str) -> list[dict]:
     results = []
     seen_urls = set()
 
-    # Google News discovery.
-    for query in queries:
-        params = {
-            "q": query,
-            "hl": "en-IN",
-            "gl": "IN",
-            "ceid": "IN:en",
-        }
+    # Keep the dynamic query set broad, but bounded for serverless execution.
+    discovery_queries = queries[:8]
 
-        try:
-            response = requests.get(
-                NEWS_RSS_URL,
-                params=params,
-                timeout=12,
-                headers={"User-Agent": "QuntumMines-FakeNewsDetector/1.0"},
-            )
-            response.raise_for_status()
-            root = ET.fromstring(response.content)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            for item in root.findall(".//item"):
-                title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
-                pub_date = (item.findtext("pubDate") or "").strip()
+    jobs = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for query in discovery_queries:
+            jobs.append(executor.submit(fetch_google_news_evidence, query, 12))
+            jobs.append(executor.submit(fetch_gdelt_evidence, query, 12))
 
-                description = html.unescape(
-                    item.findtext("description") or ""
-                )
-                description = re.sub(r"<[^>]+>", " ", description)
-                description = re.sub(r"\s+", " ", description).strip()
-
-                if not title or not link or link in seen_urls:
-                    continue
-
-                seen_urls.add(link)
-                results.append(
-                    normalize_evidence_item(
-                        {
-                            "title": title,
-                            "description": description,
-                            "published": pub_date,
-                            "url": link,
-                            "content": "",
-                        }
-                    )
-                )
-        except Exception:
-            continue
-
-    # GDELT discovery. Use the strongest compact queries first.
-    for query in queries[:4]:
-        for item in fetch_gdelt_evidence(query, max_records=20):
-            url = item.get("url", "")
-            if not url or url in seen_urls:
+        for future in as_completed(jobs):
+            try:
+                items = future.result()
+            except Exception as exc:
+                print(f"[retrieval] discovery worker failed: {exc}")
                 continue
-            seen_urls.add(url)
-            results.append(item)
+
+            for item in items:
+                url = (item.get("url") or "").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                results.append(item)
+
+    print(f"[retrieval] discovered {len(results)} unique results for claim")
 
     return results
 
@@ -586,30 +614,62 @@ def fetch_news_evidence(
     max_results: int = 12,
 ) -> list[dict]:
     """
-    Dynamically discover evidence from multiple independent news indexes,
-    then fetch the underlying publisher pages. No individual news answer
-    is stored in the application.
+    Discover current evidence dynamically, rank it, and fetch a bounded number
+    of publisher pages in parallel. RSS/GDELT metadata remains usable even if
+    a publisher page cannot be fetched.
     """
     results = collect_dynamic_evidence(user_text)
-
     if not results:
         return []
 
-    # Keep a broad candidate pool. Retrieval is discovery; the LLM performs
-    # the final semantic comparison. Do not discard a source only because its
-    # wording differs from the user's wording.
+    # Rank discovery metadata first. This is important because publisher-page
+    # fetching can fail on Vercel and must not erase useful RSS/GDELT evidence.
+    for item in results:
+        item["_relevance"] = evidence_relevance_score(item, user_text)
+
     results.sort(
         key=lambda item: (
+            item.get("_relevance", 0.0),
             source_quality_score(item),
-            evidence_relevance_score(item, user_text),
         ),
         reverse=True,
     )
 
-    fetched = [fetch_article_evidence(item) for item in results[:50]]
+    # Keep enough candidates to obtain multiple independent publishers without
+    # making dozens of serial outbound requests.
+    candidates = results[:24]
 
-    for item in fetched:
-        item["_relevance"] = evidence_relevance_score(item, user_text)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    fetched = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_map = {
+            executor.submit(fetch_article_evidence, item): item
+            for item in candidates
+        }
+
+        for future in as_completed(future_map):
+            original = future_map[future]
+            try:
+                item = future.result()
+            except Exception as exc:
+                print(f"[retrieval] publisher fetch failed: {exc}")
+                item = dict(original)
+
+            # Never lose the original discovery metadata.
+            if not item.get("title"):
+                item["title"] = original.get("title", "")
+            if not item.get("description"):
+                item["description"] = original.get("description", "")
+            if not item.get("published"):
+                item["published"] = original.get("published", "")
+            if not item.get("url"):
+                item["url"] = original.get("url", "")
+            if "content" not in item:
+                item["content"] = ""
+
+            item["_relevance"] = evidence_relevance_score(item, user_text)
+            fetched.append(item)
 
     fetched.sort(
         key=lambda item: (
@@ -619,7 +679,6 @@ def fetch_news_evidence(
         reverse=True,
     )
 
-    # Prefer independent domains rather than many copies from one publisher.
     selected = []
     domain_counts = {}
 
@@ -632,7 +691,8 @@ def fetch_news_evidence(
         if len(selected) >= max_results:
             break
 
-    if len(selected) < min(max_results, len(fetched)):
+    # Fill remaining slots if diversity alone was too restrictive.
+    if len(selected) < max_results:
         selected_urls = {item.get("url") for item in selected}
         for item in fetched:
             if item.get("url") in selected_urls:
@@ -641,25 +701,26 @@ def fetch_news_evidence(
             if len(selected) >= max_results:
                 break
 
+    print(
+        f"[retrieval] selected {len(selected)} evidence items; "
+        f"top relevance={[round(x.get('_relevance', 0), 3) for x in selected[:5]]}"
+    )
     return selected
 
 
-
 def has_usable_evidence(evidence: list[dict], claim: str) -> bool:
-    """Return true when dynamic retrieval produced substantive source material."""
+    """Check whether dynamic retrieval produced substantively relevant evidence."""
     if not evidence:
         return False
 
     for item in evidence:
-        material = " ".join(
-            [
-                str(item.get("title") or ""),
-                str(item.get("description") or ""),
-                str(item.get("content") or ""),
-            ]
+        relevance = evidence_relevance_score(item, claim)
+        content = (
+            f"{item.get('title', '')} "
+            f"{item.get('description', '')} "
+            f"{item.get('content', '')}"
         ).strip()
-
-        if len(material) >= 40:
+        if content and relevance >= 0.15:
             return True
 
     return False
@@ -669,7 +730,7 @@ def build_evidence_text(evidence: list[dict]) -> str:
     if not evidence:
         return (
             "NO_RETRIEVED_EVIDENCE\n"
-            "No usable dynamically retrieved source material was available. "
+            "No usable dynamically retrieved evidence was available. "
             "Do not invent facts or claim that a source was checked."
         )
 
@@ -678,6 +739,7 @@ def build_evidence_text(evidence: list[dict]) -> str:
         chunks.append(
             f"[Source {index}]\n"
             f"Domain: {source_domain(item.get('url', ''))}\n"
+            f"Publisher: {item.get('publisher', '')}\n"
             f"Relevance: {item.get('_relevance', 0):.2f}\n"
             f"Title: {item['title']}\n"
             f"Published: {item['published']}\n"
@@ -713,14 +775,7 @@ def call_hf_llm(user_text: str, evidence: list[dict]) -> dict:
 
     retrieval_status = (
         "USABLE_DYNAMIC_EVIDENCE"
-        if any(
-            (
-                item.get("title")
-                or item.get("description")
-                or item.get("content")
-            )
-            for item in ranked_evidence
-        )
+        if has_usable_evidence(ranked_evidence, user_text)
         else "NO_USABLE_DYNAMIC_EVIDENCE"
     )
 
@@ -816,16 +871,15 @@ def call_hf_llm(user_text: str, evidence: list[dict]) -> dict:
 
     confidence = max(0, min(100, confidence))
 
-    corrected_version = parsed.get("corrected_version", user_text)
-    if not isinstance(corrected_version, str) or len(corrected_version.strip()) < 12:
-        corrected_version = user_text
-
     return {
         "type": "news_analysis",
         "verdict": verdict,
         "confidence": confidence,
         "explanation": parsed.get("explanation", ""),
-        "corrected_version": corrected_version,
+        "corrected_version": parsed.get(
+            "corrected_version",
+            user_text,
+        ),
     }
 
 
