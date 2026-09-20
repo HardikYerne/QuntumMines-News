@@ -152,35 +152,24 @@ SYSTEM_PROMPT = (
     "IMPORTANT EVIDENCE RULES:\n"
     "1. Evidence below comes from dynamically retrieved public sources.\n"
     "2. Do not claim that you personally browsed, searched, or verified anything.\n"
-    "3. Do not invent sources, facts, dates, or evidence.\n"
+    "3. Do not invent sources, facts, dates, numbers, or evidence.\n"
     "4. If the supplied evidence does not establish the claim, use UNVERIFIABLE.\n"
     "5. Do not call a claim fake merely because no search result was found.\n"
-    "6. Confidence must represent confidence in the verdict, not confidence "
-    "that the article exists.\n"
+    "6. Confidence must represent confidence in the verdict, not confidence that an article exists.\n"
     "7. For REAL, require meaningful supporting evidence from the retrieved results.\n"
-    "8. For LIKELY FAKE, require meaningful contradictory evidence or a clear "
-    "internal factual contradiction.\n"
+    "8. For LIKELY FAKE, require meaningful contradictory evidence or a clear internal factual contradiction.\n"
     "9. Otherwise return UNVERIFIABLE.\n"
     "10. Use retrieved evidence, not memorized facts, as the primary basis for the verdict.\n"
-    "11. When multiple independent sources agree on material facts, treat that agreement as stronger evidence.\n"
-    "12. Do not treat source count alone as proof; compare the actual facts, dates, numbers, and context.\n"
-    "13. If sources conflict, explain the conflict and prefer the most direct and authoritative evidence.\n"
-    "14. Do not require identical wording between the claim and evidence; evaluate semantic agreement, context, dates, and numbers.\n""10. For numerical claims, compare the exact numbers, dates, units, and subject in the evidence.\n"
-"16. A related article that discusses the same topic but different numbers is not sufficient to prove or disprove the claim.\n"
-"17. For claims containing multiple facts, evaluate each material fact separately.\n"
-
-    "10. When a claim says that a person currently holds a public office, "
-    "compare the claimed person with evidence identifying the current office-holder. "
-    "If reliable retrieved evidence identifies a different current office-holder, "
-    "that is meaningful contradictory evidence and the claim should be classified "
-    "as LIKELY FAKE.\n"
-    "11. Do not treat absence of a person's name in search results as proof that "
-    "the person does not hold an office. Use explicit contradictory evidence when available.\n"
-    "12. Prefer current and authoritative evidence when the claim concerns a "
-    "current office, current role, current event, or other time-sensitive fact.\n"
-    "13. Never say 'I couldn't find reliable sources' unless the application "
-    "actually supplied no useful evidence. Prefer 'The retrieved evidence is "
-    "insufficient to establish the claim.'\n\n"
+    "11. Multiple independent sources agreeing on the same material facts strengthen the evidence, but source count alone is not proof.\n"
+    "12. Compare the actual facts, dates, numbers, units, subjects, and context. Do not require identical wording.\n"
+    "13. If sources conflict, explain the conflict and prefer the most direct and authoritative evidence available.\n"
+    "14. For numerical claims, compare exact numbers, dates, units, and subjects.\n"
+    "15. A related article discussing the same topic but different numbers is not sufficient to prove or disprove the claim.\n"
+    "16. For claims containing multiple facts, evaluate each material fact separately.\n"
+    "17. When a claim says a person currently holds a public office, compare the claimed person with evidence identifying the current office-holder. If reliable retrieved evidence identifies a different current office-holder, that is meaningful contradictory evidence.\n"
+    "18. Do not treat absence of a person's name in search results as proof that the person does not hold an office.\n"
+    "19. Prefer current evidence for current events and other time-sensitive facts.\n"
+    "20. If the application supplied usable evidence, do not say that no public results were found. Explain what the retrieved evidence does or does not establish.\n\n"
     "For GENERAL CONVERSATION, return only valid JSON:\n"
     "{\n"
     '  "type": "general",\n'
@@ -196,6 +185,7 @@ SYSTEM_PROMPT = (
     "}\n\n"
     "Do not use markdown fences and do not add text outside the JSON."
 )
+
 
 GREETING_RESPONSES = {
     "hi": "Hi! How can I help you today?",
@@ -298,6 +288,18 @@ def extract_search_queries(user_text: str) -> list[str]:
         queries.append(f"{text[:180]} site:{domain}")
 
     return list(dict.fromkeys(q.strip() for q in queries if q.strip()))
+
+
+
+def normalize_evidence_item(item: dict) -> dict:
+    """Normalize dynamically retrieved evidence without storing news facts."""
+    return {
+        "title": str(item.get("title") or "").strip(),
+        "description": str(item.get("description") or "").strip(),
+        "published": str(item.get("published") or "").strip(),
+        "url": str(item.get("url") or "").strip(),
+        "content": str(item.get("content") or "").strip(),
+    }
 
 
 def source_domain(url: str) -> str:
@@ -702,6 +704,24 @@ def call_hf_llm(user_text: str, evidence: list[dict]) -> dict:
         ranked_evidence.append(copied)
 
     evidence_text = build_evidence_text(ranked_evidence)
+
+    retrieval_status = (
+        "USABLE_DYNAMIC_EVIDENCE"
+        if any(
+            (
+                item.get("title")
+                or item.get("description")
+                or item.get("content")
+            )
+            for item in ranked_evidence
+        )
+        else "NO_USABLE_DYNAMIC_EVIDENCE"
+    )
+
+    evidence_text = (
+        f"RETRIEVAL STATUS: {retrieval_status}\n\n"
+        + evidence_text
+    )
 
     payload = {
         "model": HF_LLM_MODEL,
