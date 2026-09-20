@@ -164,9 +164,10 @@ SYSTEM_PROMPT = (
     "10. Use retrieved evidence, not memorized facts, as the primary basis for the verdict.\n"
     "11. When multiple independent sources agree on material facts, treat that agreement as stronger evidence.\n"
     "12. Do not treat source count alone as proof; compare the actual facts, dates, numbers, and context.\n"
-    "13. If sources conflict, explain the conflict and prefer the most direct and authoritative evidence.\n""10. For numerical claims, compare the exact numbers, dates, units, and subject in the evidence.\n"
-"11. A related article that discusses the same topic but different numbers is not sufficient to prove or disprove the claim.\n"
-"12. For claims containing multiple facts, evaluate each material fact separately.\n"
+    "13. If sources conflict, explain the conflict and prefer the most direct and authoritative evidence.\n"
+    "14. Do not require identical wording between the claim and evidence; evaluate semantic agreement, context, dates, and numbers.\n""10. For numerical claims, compare the exact numbers, dates, units, and subject in the evidence.\n"
+"16. A related article that discusses the same topic but different numbers is not sufficient to prove or disprove the claim.\n"
+"17. For claims containing multiple facts, evaluate each material fact separately.\n"
 
     "10. When a claim says that a person currently holds a public office, "
     "compare the claimed person with evidence identifying the current office-holder. "
@@ -283,6 +284,19 @@ def extract_search_queries(user_text: str) -> list[str]:
     ):
         queries.append(f"{text[:160]} latest")
 
+    # Dynamic source-oriented searches. These do not contain any claim-specific
+    # facts; they improve recall when one news index misses the story.
+    source_domains = [
+        "reuters.com",
+        "thehindu.com",
+        "indianexpress.com",
+        "hindustantimes.com",
+        "timesofindia.indiatimes.com",
+        "economictimes.indiatimes.com",
+    ]
+    for domain in source_domains[:4]:
+        queries.append(f"{text[:180]} site:{domain}")
+
     return list(dict.fromkeys(q.strip() for q in queries if q.strip()))
 
 
@@ -359,20 +373,43 @@ def evidence_relevance_score(item: dict, claim: str) -> float:
     return min(score, 1.0)
 
 
+
+def resolve_publisher_url(url: str) -> str:
+    """Resolve a news-index URL to the publisher URL without knowing the story."""
+    if not url:
+        return url
+
+    try:
+        response = requests.get(
+            url,
+            timeout=8,
+            allow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/153 Safari/537.36"
+            },
+            stream=True,
+        )
+        return response.url or url
+    except Exception:
+        return url
+
+
 def extract_article_text(html_text: str) -> tuple[str, str, str]:
     """Extract generic publisher-page title, description, and article text."""
     return parse_html_evidence(html_text)
 
 
 def fetch_article_evidence(item: dict) -> dict:
-    """Follow the discovered URL and retrieve the underlying publisher page."""
+    """Resolve and fetch the dynamically discovered publisher page."""
     result = dict(item)
-    url = item.get("url", "")
+    original_url = item.get("url", "")
+    url = resolve_publisher_url(original_url)
 
     try:
         response = requests.get(
             url,
-            timeout=10,
+            timeout=12,
             allow_redirects=True,
             headers={
                 "User-Agent": (
@@ -389,7 +426,9 @@ def fetch_article_evidence(item: dict) -> dict:
         if "html" not in content_type:
             return result
 
-        page_title, page_description, article_content = extract_article_text(response.text)
+        page_title, page_description, article_content = extract_article_text(
+            response.text
+        )
 
         if page_title:
             result["title"] = page_title
@@ -400,14 +439,15 @@ def fetch_article_evidence(item: dict) -> dict:
         result["url"] = final_url
         result["publisher"] = source_domain(final_url)
         result["article_fetched"] = bool(article_content)
+        result["original_url"] = original_url
         return result
 
     except Exception:
         result["content"] = ""
-        result["publisher"] = source_domain(url)
+        result["publisher"] = source_domain(url or original_url)
         result["article_fetched"] = False
+        result["original_url"] = original_url
         return result
-
 
 
 def fetch_gdelt_evidence(
@@ -450,11 +490,7 @@ def fetch_gdelt_evidence(
                     {
                         "title": title,
                         "description": "",
-                        "published": (
-                            article.get("seendate")
-                            or article.get("socialimage")
-                            or ""
-                        ),
+                        "published": article.get("seendate") or "",
                         "url": url,
                         "content": "",
                     }
@@ -602,12 +638,31 @@ def fetch_news_evidence(
     return selected
 
 
+
+def has_usable_evidence(evidence: list[dict], claim: str) -> bool:
+    """Check whether dynamic retrieval produced substantively relevant evidence."""
+    if not evidence:
+        return False
+
+    for item in evidence:
+        relevance = evidence_relevance_score(item, claim)
+        content = (
+            f"{item.get('title', '')} "
+            f"{item.get('description', '')} "
+            f"{item.get('content', '')}"
+        ).strip()
+        if content and relevance >= 0.15:
+            return True
+
+    return False
+
+
 def build_evidence_text(evidence: list[dict]) -> str:
     if not evidence:
         return (
             "NO_RETRIEVED_EVIDENCE\n"
-            "The application could not retrieve usable public news results. "
-            "Do not claim that the web was successfully searched."
+            "No usable dynamically retrieved evidence was available. "
+            "Do not invent facts or claim that a source was checked."
         )
 
     chunks = []
@@ -620,6 +675,7 @@ def build_evidence_text(evidence: list[dict]) -> str:
             f"Published: {item['published']}\n"
             f"Description: {item['description']}\n"
             f"Article Content: {item.get('content', '')[:12000]}\n"
+            f"Publisher Page Retrieved: {item.get('article_fetched', False)}\n"
             f"URL: {item['url']}"
         )
 
